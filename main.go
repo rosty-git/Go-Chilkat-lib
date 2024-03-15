@@ -4,10 +4,6 @@ import (
 	"chilkat"
 	"context"
 	"fmt"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"net"
 	_ "net/http/pprof"
 	"os"
@@ -17,6 +13,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 type Mailbox struct {
@@ -139,6 +140,8 @@ var (
 )
 
 func main() {
+	ctx := context.Background()
+
 	var rLimit syscall.Rlimit
 	err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	if err != nil {
@@ -153,7 +156,7 @@ func main() {
 
 	// Unlimited threads and memory
 	debug.SetMaxThreads(25000)
-	//debug.SetMemoryLimit(math.MaxInt64)
+	// debug.SetMemoryLimit(math.MaxInt64)
 
 	// Environment variables
 	err = godotenv.Load()
@@ -172,9 +175,9 @@ func main() {
 	}
 
 	// Database connection
-	pool = initializeDB()
+	pool = initializeDB(ctx)
 	defer pool.Close()
-	mailboxes, err := getMailboxes()
+	mailboxes, err := getMailboxes(ctx)
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -182,7 +185,7 @@ func main() {
 			Msg("Failed to get mailboxes")
 	}
 
-	sharedData, _ = getSharedData()
+	sharedData, _ = getSharedData(ctx)
 	activeMailboxes = make(map[int]*Mailbox)
 
 	doneCount := 0
@@ -251,7 +254,7 @@ func main() {
 			initialDataCopy := sharedData
 			sharedDataMutex.Unlock()
 
-			go handleMailbox(mailboxCopy, controlChan, commandChan, initialDataCopy)
+			go handleMailbox(ctx, mailboxCopy, controlChan, commandChan, initialDataCopy)
 
 			log.Info().
 				Int("current", i+j+1).
@@ -274,7 +277,7 @@ func main() {
 	select {}
 }
 
-func initializeDB() *pgxpool.Pool {
+func initializeDB(ctx context.Context) *pgxpool.Pool {
 	databaseURL := os.Getenv("DATABASE_URL")
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -285,7 +288,7 @@ func initializeDB() *pgxpool.Pool {
 	maxConns, _ := strconv.Atoi(os.Getenv("MAX_DB_CONNECTIONS"))
 	config.MaxConns = int32(maxConns)
 
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -294,10 +297,10 @@ func initializeDB() *pgxpool.Pool {
 	return pool
 }
 
-func getSharedData() (SharedData, error) {
+func getSharedData(ctx context.Context) (SharedData, error) {
 	var data SharedData
 
-	rows, err := pool.Query(context.Background(), `SELECT name, value FROM settings`)
+	rows, err := pool.Query(ctx, `SELECT name, value FROM settings`)
 	if err != nil {
 		return data, fmt.Errorf("Error of get shared data: %w", err)
 	}
@@ -317,7 +320,7 @@ func getSharedData() (SharedData, error) {
 		}
 	}
 
-	rows, err = pool.Query(context.Background(), `SELECT profile_id, keyword, is_activate, is_body, is_subject, is_attachment, is_sent, is_from, is_only_attachments, is_regex FROM keywords WHERE is_activate = true`)
+	rows, err = pool.Query(ctx, `SELECT profile_id, keyword, is_activate, is_body, is_subject, is_attachment, is_sent, is_from, is_only_attachments, is_regex FROM keywords WHERE is_activate = true`)
 	if err != nil {
 		return data, fmt.Errorf("Error of get keywords: %w", err)
 	}
@@ -331,7 +334,7 @@ func getSharedData() (SharedData, error) {
 		data.Keywords = append(data.Keywords, keyword)
 	}
 
-	rows, err = pool.Query(context.Background(), `SELECT profile_id, exception, is_activate, is_body, is_subject, is_attachment, is_sent, is_from FROM exceptions WHERE is_activate = true`)
+	rows, err = pool.Query(ctx, `SELECT profile_id, exception, is_activate, is_body, is_subject, is_attachment, is_sent, is_from FROM exceptions WHERE is_activate = true`)
 	if err != nil {
 		return data, fmt.Errorf("Error of get exceptions: %w", err)
 	}
@@ -348,10 +351,10 @@ func getSharedData() (SharedData, error) {
 	return data, nil
 }
 
-func getMailboxes() ([]Mailbox, error) {
+func getMailboxes(ctx context.Context) ([]Mailbox, error) {
 	query := `SELECT id, profile_id, email, country, imap_user, imap_password, imap_server, imap_port, proxy, status, is_activate, status_test, uids, is_flagged, today, all_time, comments, created_at, updated_at, admin_id, modified, color_flag, xoauth2 FROM mails WHERE is_activate = true  ORDER BY id ASC;`
 
-	rows, err := pool.Query(context.Background(), query)
+	rows, err := pool.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("Error of get mails: %w", err)
 	}
@@ -366,7 +369,7 @@ func getMailboxes() ([]Mailbox, error) {
 		}
 		mailboxes = append(mailboxes, mailbox)
 
-		if _, err := pool.Exec(context.Background(), `UPDATE mails SET status = 'STARTING' WHERE id = $1`, *mailbox.Id); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE mails SET status = 'STARTING' WHERE id = $1`, *mailbox.Id); err != nil {
 			return nil, fmt.Errorf("Error of update mails status: %w", err)
 		}
 
@@ -377,16 +380,16 @@ func getMailboxes() ([]Mailbox, error) {
 
 	// Обновляем статус почт, где is_activate = false, на PAUSED.
 	updateQuery := `UPDATE mails SET status = 'PAUSED' WHERE is_activate = false;`
-	if _, err := pool.Exec(context.Background(), updateQuery); err != nil {
+	if _, err := pool.Exec(ctx, updateQuery); err != nil {
 		return nil, fmt.Errorf("error updating status of inactive mails to PAUSED: %w", err)
 	}
 
 	return mailboxes, nil
 }
 
-func getLetter(id int) (Letter, error) {
+func getLetter(ctx context.Context, id int) (Letter, error) {
 	var letter Letter
-	row := pool.QueryRow(context.Background(), `SELECT id, edited_eml, id_email, type, admin_id, status, folder_eml FROM letters WHERE id = $1;`, id)
+	row := pool.QueryRow(ctx, `SELECT id, edited_eml, id_email, type, admin_id, status, folder_eml FROM letters WHERE id = $1;`, id)
 	err := row.Scan(&letter.Id, &letter.EditedEml, &letter.MailId, &letter.Type, &letter.AdminId, &letter.Status, &letter.FolderEml)
 	if err != nil {
 		return Letter{}, fmt.Errorf("Error of get letter: %w", err)
@@ -395,7 +398,7 @@ func getLetter(id int) (Letter, error) {
 	return letter, nil
 }
 
-func handleMailbox(mailbox Mailbox, controlChan chan<- string, commandChan <-chan Command, localData SharedData) {
+func handleMailbox(ctx context.Context, mailbox Mailbox, controlChan chan<- string, commandChan <-chan Command, localData SharedData) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error().
@@ -411,7 +414,7 @@ func handleMailbox(mailbox Mailbox, controlChan chan<- string, commandChan <-cha
 	defer imap.DisposeImap()
 
 	if !connectIMAP(imap, mailbox) {
-		//log.Error().
+		// log.Error().
 		//	Str("mailbox", *mailbox.ImapUser).
 		//	Str("error", imap.LastErrorText()).
 		//	Msg("Failed connectIMAP")
@@ -421,7 +424,7 @@ func handleMailbox(mailbox Mailbox, controlChan chan<- string, commandChan <-cha
 
 	success := imap.IdleStart()
 	if !success {
-		//log.Error().
+		// log.Error().
 		//	Str("mailbox", *mailbox.ImapUser).
 		//	Str("error", imap.LastErrorText()).
 		//	Msg("Failed IdleStart")
@@ -437,19 +440,19 @@ func handleMailbox(mailbox Mailbox, controlChan chan<- string, commandChan <-cha
 			if imap.LastMethodSuccess() != true {
 				errorAt := time.Now()
 
-				if _, err := pool.Exec(context.Background(), `UPDATE mails SET error_msg = $1, error_at = $2 WHERE id = $3`, imap.LastErrorXml(), errorAt, *mailbox.Id); err != nil {
+				if _, err := pool.Exec(ctx, `UPDATE mails SET error_msg = $1, error_at = $2 WHERE id = $3`, imap.LastErrorXml(), errorAt, *mailbox.Id); err != nil {
 					log.Error().
 						Err(err).
 						Int("mail", *mailbox.Id).
 						Msg("Wrong update mail status error")
 				}
 
-				//log.Error().
+				// log.Error().
 				//	Str("mailbox", *mailbox.ImapUser).
 				//	//Str("error", imap.LastErrorXml()).
 				//	Msg("Failed IdleCheck")
 				if !connectIMAP(imap, mailbox) {
-					//log.Error().
+					// log.Error().
 					//	Str("mailbox", *mailbox.ImapUser).
 					//	Str("error", imap.LastErrorText()).
 					//	Msg("Failed connectIMAP")
@@ -459,20 +462,20 @@ func handleMailbox(mailbox Mailbox, controlChan chan<- string, commandChan <-cha
 
 				success = imap.IdleStart()
 				if !success {
-					if _, err := pool.Exec(context.Background(), `UPDATE mails SET status = 'RESTART IDLE FAILED' WHERE id = $1`, *mailbox.Id); err != nil {
+					if _, err := pool.Exec(ctx, `UPDATE mails SET status = 'RESTART IDLE FAILED' WHERE id = $1`, *mailbox.Id); err != nil {
 						log.Error().
 							Err(err).
 							Int("mail", *mailbox.Id).
 							Msg("Failed update mail status")
 					}
-					//log.Error().
+					// log.Error().
 					//	Str("mailbox", *mailbox.ImapUser).
 					//	Str("error", imap.LastErrorText()).
 					//	Msg("Failed IdleStart")
 					controlChan <- fmt.Sprintf("delete %d", *mailbox.Id)
 					return
 				}
-				//log.Info().
+				// log.Info().
 				//	Str("mailbox", *mailbox.ImapUser).
 				//	//Str("error", imap.LastErrorText()).
 				//	Msg("Restarted Idle")
@@ -493,10 +496,9 @@ func handleMailbox(mailbox Mailbox, controlChan chan<- string, commandChan <-cha
 						Str("error", xml.LastErrorXml()).
 						Msg("Failed to load XML")
 				} else {
-
 				}
 			} else {
-				//fmt.Println("No updates from IDLE check")
+				// fmt.Println("No updates from IDLE check")
 			}
 		}
 	}
@@ -560,10 +562,9 @@ func ParseProxyConfig(proxyString string) (*ProxyConfig, error) {
 	return proxyConfig, nil
 }
 
-func connectIMAP(imap *chilkat.Imap, mailbox Mailbox) bool {
-
+func connectIMAP(ctx context.Context, imap *chilkat.Imap, mailbox Mailbox) bool {
 	if *mailbox.Proxy == "" {
-		if _, err := pool.Exec(context.Background(), `UPDATE mails SET status = 'NO PROXY' WHERE id = $1`, *mailbox.Id); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE mails SET status = 'NO PROXY' WHERE id = $1`, *mailbox.Id); err != nil {
 			log.Error().
 				Err(err).
 				Int("mail", *mailbox.Id).
@@ -598,19 +599,19 @@ func connectIMAP(imap *chilkat.Imap, mailbox Mailbox) bool {
 
 	success := imap.Connect(*mailbox.ImapServer)
 	if !success {
-		updateMailStatusBasedOnError(imap.LastErrorXml(), *mailbox.Id)
+		updateMailStatusBasedOnError(ctx, imap.LastErrorXml(), *mailbox.Id)
 		return false
 	}
 
 	success = imap.Login(*mailbox.ImapUser, *mailbox.ImapPassword)
 	if !success {
-		updateMailStatusBasedOnError(imap.LastErrorXml(), *mailbox.Id)
+		updateMailStatusBasedOnError(ctx, imap.LastErrorXml(), *mailbox.Id)
 		return false
 	}
 
 	success = imap.SelectMailbox("Inbox")
 	if !success {
-		updateMailStatusBasedOnError(imap.LastErrorXml(), *mailbox.Id)
+		updateMailStatusBasedOnError(ctx, imap.LastErrorXml(), *mailbox.Id)
 		return false
 	}
 
@@ -622,7 +623,7 @@ func connectIMAP(imap *chilkat.Imap, mailbox Mailbox) bool {
 	//	return false
 	//}
 
-	if _, err := pool.Exec(context.Background(), `UPDATE mails SET status = 'LOGIN OK' WHERE id = $1`, *mailbox.Id); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE mails SET status = 'LOGIN OK' WHERE id = $1`, *mailbox.Id); err != nil {
 		log.Error().
 			Err(err).
 			Int("mail", *mailbox.Id).
@@ -633,7 +634,7 @@ func connectIMAP(imap *chilkat.Imap, mailbox Mailbox) bool {
 	return true
 }
 
-func updateMailStatusBasedOnError(errorText string, mailId int) {
+func updateMailStatusBasedOnError(ctx context.Context, errorText string, mailId int) {
 	var status string
 	errorTextLower := strings.ToLower(errorText) // Приведение текста ошибки к нижнему регистру
 
@@ -654,7 +655,6 @@ func updateMailStatusBasedOnError(errorText string, mailId int) {
 		strings.Contains(errorTextLower, strings.ToLower("Invalid login or password")) ||
 		strings.Contains(errorTextLower, strings.ToLower("Invalid username or password")) {
 		status = "AUTHENTICATION FAILED"
-
 	} else if strings.Contains(errorTextLower, strings.ToLower("Failed to get next response line from IMAP server.")) ||
 		strings.Contains(errorTextLower, strings.ToLower("Escaping quotes and backslashes in mailbox name")) ||
 		strings.Contains(errorTextLower, strings.ToLower("NO LOGIN failed")) ||
@@ -670,7 +670,7 @@ func updateMailStatusBasedOnError(errorText string, mailId int) {
 		status = "UNDEFINED ERROR"
 	}
 
-	if _, err := pool.Exec(context.Background(), `UPDATE mails SET status = $1, error_msg = $2 WHERE id = $3`, status, errorText, mailId); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE mails SET status = $1, error_msg = $2 WHERE id = $3`, status, errorText, mailId); err != nil {
 		log.Error().
 			Err(err).
 			Int("mailId", mailId).
